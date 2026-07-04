@@ -510,3 +510,4 @@ if __name__ == "__main__":
 
     print("[5] Aplicando Spicetify...")
     print(mgr.apply_spicetify())
+    
