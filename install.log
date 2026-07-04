@@ -1,0 +1,8 @@
+[02:41:58 2026-07-04] FETCHING Version 2.43.2
+[02:41:58 2026-07-04] DOWNLOADING https://github.com/spicetify/cli/releases/download/v2.43.2/spicetify-2.43.2-linux-amd64.tar.gz
+[02:41:59 2026-07-04] EXTRACTING /home/guichin1/.spicetify/spicetify.tar.gz
+[02:41:59 2026-07-04] SETTING EXECUTABLE PERMISSIONS TO /home/guichin1/.spicetify/spicetify
+[02:41:59 2026-07-04] REMOVING /home/guichin1/.spicetify/spicetify.tar.gz
+[02:41:59 2026-07-04] spicetify path already set in /home/guichin1/.zshrc, continuing...
+[02:41:59 2026-07-04] spicetify v2.43.2 was installed successfully to /home/guichin1/.spicetify
+[02:41:59 2026-07-04] Run 'spicetify --help' to get started
