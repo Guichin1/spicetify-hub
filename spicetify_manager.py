@@ -15,6 +15,12 @@ Design:
   no final do arquivo, que expõe os mesmos métodos como sinais Qt.
 - Toda chamada de subprocess devolve um CommandResult (dataclass) com
   success, message e output — nunca uma exceção "solta" para a UI.
+- _run usa Popen (não subprocess.run) e lê stdout/stderr linha a linha
+  em tempo real. Métodos que executam comandos longos (apt update,
+  curl do Spicetify, etc.) aceitam um on_line_received opcional —
+  cada linha chega assim que é impressa pelo processo, não só no
+  final. O CommandResult final ainda carrega o log inteiro em
+  'output', para quem quiser consultar depois do fato.
 - Comandos que exigem root usam pkexec (prompt gráfico nativo do
   ambiente, sem precisar de terminal/sudo interativo).
 """
@@ -24,6 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -92,6 +99,13 @@ class SpicetifyManager:
         f"https://repository.spotify.com stable non-free"
     )
     SPICETIFY_INSTALL_SCRIPT_URL = "https://raw.githubusercontent.com/spicetify/cli/main/install.sh"
+    # Repositório atual é spicetify/marketplace — o nome antigo
+    # (spicetify/spicetify-marketplace) ainda aparece em tutoriais
+    # desatualizados espalhados pela internet, mas foi o que a própria
+    # documentação oficial (spicetify.app/docs) mostrou na consulta.
+    SPICETIFY_MARKETPLACE_INSTALL_URL = (
+        "https://raw.githubusercontent.com/spicetify/marketplace/main/resources/install.sh"
+    )
 
     TIMEOUT_SHORT = 20
     TIMEOUT_LONG = 180
@@ -108,27 +122,103 @@ class SpicetifyManager:
         timeout: int = TIMEOUT_SHORT,
         input_text: Optional[str] = None,
         shell: bool = False,
+        on_line_received: Optional[Callable[[str], None]] = None,
     ) -> CommandResult:
-        """Wrapper único e seguro para subprocess.run."""
+        """
+        Wrapper único para execução de subprocess. Usa Popen (não
+        subprocess.run) e consome stdout/stderr LINHA A LINHA conforme
+        elas chegam — cada linha vai imediatamente para
+        on_line_received (se fornecido), em vez de esperar o processo
+        inteiro terminar. O CommandResult final ainda carrega o log
+        completo em 'output' (todas as linhas juntas), para histórico.
+
+        stderr é fundido em stdout (STDOUT em vez de PIPE separado) de
+        propósito: se eu ler dois pipes separados um de cada vez, um
+        deles pode encher o buffer do SO e travar o processo (deadlock
+        clássico de subprocess com dois PIPEs). Fundir os streams evita
+        isso e ainda preserva a ordem cronológica real das linhas.
+
+        subprocess.run tinha timeout nativo; Popen não tem para leitura
+        linha a linha, então implemento na mão com threading.Timer:
+        se o tempo estourar, mato o processo, o que fecha o stdout e
+        naturalmente encerra o loop de leitura abaixo.
+        """
+        lines: list[str] = []
+        timeout_flag = {"hit": False}
+        proc: Optional[subprocess.Popen] = None
+
         try:
             logger.info("Executando: %s", " ".join(cmd) if not shell else cmd)
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd if not shell else " ".join(cmd),
                 shell=shell,
-                input=input_text,
-                capture_output=True,
+                stdin=subprocess.PIPE if input_text is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                timeout=timeout,
+                bufsize=1,  # line-buffered
+                start_new_session=True,  # cria um novo grupo de processos
             )
-            combined_output = (proc.stdout or "") + (proc.stderr or "")
-            success = proc.returncode == 0
+
+            if input_text is not None and proc.stdin is not None:
+                proc.stdin.write(input_text)
+                proc.stdin.close()
+
+            def _kill_on_timeout() -> None:
+                timeout_flag["hit"] = True
+                # proc.kill() só mata o processo direto (ex: bash) e
+                # NÃO seus filhos (ex: o "sleep" ou "curl" que ele
+                # disparou). Se o filho ainda tiver o fd do stdout
+                # aberto, o pipe nunca fecha e o timeout vira decorativo
+                # — foi exatamente o que aconteceu no meu primeiro
+                # teste (timeout de 1s levou 5s pra retornar). Por isso
+                # mato o GRUPO inteiro de processos, não só o líder.
+                try:
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+            timer = threading.Timer(timeout, _kill_on_timeout)
+            timer.daemon = True
+            timer.start()
+
+            try:
+                assert proc.stdout is not None
+                for raw_line in proc.stdout:
+                    line = raw_line.rstrip("\n")
+                    lines.append(line)
+                    if on_line_received is not None:
+                        try:
+                            on_line_received(line)
+                        except Exception:
+                            # Um erro no callback da UI não pode
+                            # derrubar a execução do comando em si.
+                            logger.exception(
+                                "Erro no callback on_line_received; ignorado."
+                            )
+                returncode = proc.wait()
+            finally:
+                timer.cancel()
+
+            combined_output = "\n".join(lines)
+
+            if timeout_flag["hit"]:
+                msg = f"Comando excedeu o tempo limite de {timeout}s (timeout)."
+                return CommandResult(False, msg, combined_output or msg, returncode)
+
+            success = returncode == 0
             return CommandResult(
                 success=success,
                 message="Comando concluído com sucesso." if success
-                        else f"Comando falhou (código {proc.returncode}).",
+                        else f"Comando falhou (código {returncode}).",
                 output=combined_output.strip(),
-                returncode=proc.returncode,
+                returncode=returncode,
             )
+
         except FileNotFoundError as e:
             msg = f"Binário não encontrado: {e}"
             # Repito o motivo em 'output' de propósito: todo método acima
@@ -136,13 +226,10 @@ class SpicetifyManager:
             # nunca result.message — sem isso o motivo real da falha se
             # perde silenciosamente para quem chamou.
             return CommandResult(False, msg, msg)
-        except subprocess.TimeoutExpired as e:
-            msg = f"Comando excedeu o tempo limite de {e.timeout:.0f}s (timeout)."
-            return CommandResult(False, msg, msg)
         except Exception as e:  # pragma: no cover - defesa extra
             logger.exception("Erro inesperado ao executar comando")
             msg = f"Erro inesperado: {e}"
-            return CommandResult(False, msg, msg)
+            return CommandResult(False, msg, "\n".join(lines) or msg)
 
     # ------------------------------------------------------------------ #
     # 1. Detecção do Spotify (apt vs snap)
@@ -189,12 +276,18 @@ class SpicetifyManager:
     # ------------------------------------------------------------------ #
     # 2. Migração snap -> apt (ou instalação limpa se não houver nada)
     # ------------------------------------------------------------------ #
-    def migrate_snap_to_apt(self) -> CommandResult:
+    def migrate_snap_to_apt(
+        self, on_line_received: Optional[Callable[[str], None]] = None
+    ) -> CommandResult:
         """
         Remove a versão Snap do Spotify de forma limpa e prepara a
         instalação via APT (chamando install_spotify_apt no final).
         """
-        remove = self._run(["pkexec", "snap", "remove", "spotify"], timeout=self.TIMEOUT_LONG)
+        remove = self._run(
+            ["pkexec", "snap", "remove", "spotify"],
+            timeout=self.TIMEOUT_LONG,
+            on_line_received=on_line_received,
+        )
         if not remove.success:
             return CommandResult(
                 False,
@@ -203,9 +296,11 @@ class SpicetifyManager:
             )
 
         logger.info("Snap removido com sucesso. Prosseguindo para instalação via APT.")
-        return self.install_spotify_apt()
+        return self.install_spotify_apt(on_line_received=on_line_received)
 
-    def install_spotify_apt(self) -> CommandResult:
+    def install_spotify_apt(
+        self, on_line_received: Optional[Callable[[str], None]] = None
+    ) -> CommandResult:
         """
         Instalação limpa do Spotify via repositório oficial APT.
         Usada tanto para 'não detectado' quanto pós-migração do snap.
@@ -215,7 +310,7 @@ class SpicetifyManager:
              ["pkexec", "install", "-d", "-m", "0755", "/etc/apt/keyrings"]),
         ]
         for description, cmd in steps:
-            result = self._run(cmd, timeout=self.TIMEOUT_SHORT)
+            result = self._run(cmd, timeout=self.TIMEOUT_SHORT, on_line_received=on_line_received)
             if not result.success:
                 return CommandResult(False, f"Falha em: {description}", result.output)
 
@@ -225,7 +320,7 @@ class SpicetifyManager:
             f"curl -sS {self.SPOTIFY_KEYRING_URL} | "
             f"gpg --dearmor --yes -o {self.SPOTIFY_KEYRING_PATH}"
         ]
-        key_result = self._run(key_cmd, timeout=self.TIMEOUT_SHORT)
+        key_result = self._run(key_cmd, timeout=self.TIMEOUT_SHORT, on_line_received=on_line_received)
         if not key_result.success:
             return CommandResult(False, "Falha ao importar a chave GPG do Spotify.", key_result.output)
 
@@ -234,18 +329,23 @@ class SpicetifyManager:
             "pkexec", "bash", "-c",
             f'echo "{self.SPOTIFY_REPO_LINE}" > /etc/apt/sources.list.d/spotify.list'
         ]
-        repo_result = self._run(repo_cmd, timeout=self.TIMEOUT_SHORT)
+        repo_result = self._run(repo_cmd, timeout=self.TIMEOUT_SHORT, on_line_received=on_line_received)
         if not repo_result.success:
             return CommandResult(False, "Falha ao registrar o repositório do Spotify.", repo_result.output)
 
         # Atualiza índices e instala
-        update_result = self._run(["pkexec", "apt-get", "update"], timeout=self.TIMEOUT_LONG)
+        update_result = self._run(
+            ["pkexec", "apt-get", "update"],
+            timeout=self.TIMEOUT_LONG,
+            on_line_received=on_line_received,
+        )
         if not update_result.success:
             return CommandResult(False, "Falha ao atualizar os índices do APT.", update_result.output)
 
         install_result = self._run(
             ["pkexec", "apt-get", "install", "-y", "spotify-client"],
             timeout=self.TIMEOUT_LONG,
+            on_line_received=on_line_received,
         )
         if not install_result.success:
             return CommandResult(False, "Falha ao instalar spotify-client via APT.", install_result.output)
@@ -255,7 +355,9 @@ class SpicetifyManager:
     # ------------------------------------------------------------------ #
     # 3. Ajuste de permissões (chmod a+wr via pkexec)
     # ------------------------------------------------------------------ #
-    def fix_permissions(self) -> CommandResult:
+    def fix_permissions(
+        self, on_line_received: Optional[Callable[[str], None]] = None
+    ) -> CommandResult:
         """
         Aplica chmod a+wr recursivamente nas pastas do Spotify que o
         Spicetify precisa modificar (Apps/, xpui, etc.), solicitando a
@@ -270,7 +372,7 @@ class SpicetifyManager:
             )
 
         cmd = ["pkexec", "chmod", "-R", "a+wr", *existing_paths]
-        result = self._run(cmd, timeout=self.TIMEOUT_SHORT)
+        result = self._run(cmd, timeout=self.TIMEOUT_SHORT, on_line_received=on_line_received)
         if result.success:
             return CommandResult(
                 True,
@@ -282,7 +384,9 @@ class SpicetifyManager:
     # ------------------------------------------------------------------ #
     # 4. Instalação do Spicetify CLI (script oficial)
     # ------------------------------------------------------------------ #
-    def install_spicetify_cli(self) -> CommandResult:
+    def install_spicetify_cli(
+        self, on_line_received: Optional[Callable[[str], None]] = None
+    ) -> CommandResult:
         """
         Instala o Spicetify CLI via script oficial (curl | sh).
         Executado como usuário normal — o Spicetify CLI não deve
@@ -304,7 +408,7 @@ class SpicetifyManager:
             "bash", "-c",
             f"curl -fsSL {self.SPICETIFY_INSTALL_SCRIPT_URL} | sh"
         ]
-        result = self._run(cmd, timeout=self.TIMEOUT_LONG)
+        result = self._run(cmd, timeout=self.TIMEOUT_LONG, on_line_received=on_line_received)
 
         # O script oficial sai com código 0 mesmo quando se recusa a
         # instalar por detectar root/sudo. Trato isso como falha real.
@@ -393,25 +497,120 @@ class SpicetifyManager:
         )
 
     # ------------------------------------------------------------------ #
+    # Checagem compartilhada — usada por todo método que depende do
+    # binário spicetify já instalado (apply, marketplace, restore).
+    # ------------------------------------------------------------------ #
+    def _require_spicetify_cli(self) -> tuple[Optional[str], Optional[CommandResult]]:
+        """
+        Devolve (caminho_do_binário, None) se o spicetify CLI existir,
+        ou (None, CommandResult de falha) caso contrário — assim quem
+        chama só precisa de:
+            bin_path, error = self._require_spicetify_cli()
+            if error is not None:
+                return error
+        em vez de reescrever a mesma checagem em cada método.
+        """
+        spicetify_bin = shutil.which("spicetify")
+        if spicetify_bin:
+            return spicetify_bin, None
+
+        fallback = Path.home() / ".spicetify" / "spicetify"
+        if fallback.exists():
+            return str(fallback), None
+
+        return None, CommandResult(
+            False,
+            "Spicetify CLI não encontrado. Instale-o primeiro "
+            "(install_spicetify_cli) antes de continuar.",
+            "",
+        )
+
+    # ------------------------------------------------------------------ #
     # 5. Aplicação do Spicetify (backup + apply)
     # ------------------------------------------------------------------ #
-    def apply_spicetify(self) -> CommandResult:
+    def apply_spicetify(
+        self, on_line_received: Optional[Callable[[str], None]] = None
+    ) -> CommandResult:
         """
-        Executa `spicetify backup apply`. Assume que o binário spicetify
-        já está no PATH do usuário (normalmente ~/.spicetify).
+        Executa `spicetify backup apply`.
         """
-        spicetify_bin = shutil.which("spicetify") or str(Path.home() / ".spicetify" / "spicetify")
-        if not os.path.exists(spicetify_bin) and shutil.which("spicetify") is None:
-            return CommandResult(
-                False,
-                "Binário do spicetify não encontrado. Instale o CLI antes de aplicar.",
-                "",
-            )
+        spicetify_bin, error = self._require_spicetify_cli()
+        if error is not None:
+            return error
 
-        result = self._run([spicetify_bin, "backup", "apply"], timeout=self.TIMEOUT_LONG)
+        result = self._run(
+            [spicetify_bin, "backup", "apply"],
+            timeout=self.TIMEOUT_LONG,
+            on_line_received=on_line_received,
+        )
         if result.success:
             return CommandResult(True, "Spicetify aplicado com sucesso.", result.output)
         return CommandResult(False, "Falha ao executar 'spicetify backup apply'.", result.output)
+
+    # ------------------------------------------------------------------ #
+    # 6. Instalação do Spicetify Marketplace
+    # ------------------------------------------------------------------ #
+    def install_marketplace(
+        self, on_line_received: Optional[Callable[[str], None]] = None
+    ) -> CommandResult:
+        """
+        Instala o Spicetify Marketplace via script oficial (curl | sh).
+        Exige o Spicetify CLI já instalado — o Marketplace é uma
+        custom app que vive dentro da estrutura de config dele
+        (~/.config/spicetify/CustomApps), não é standalone.
+
+        Roda como usuário normal, pelo mesmo motivo do
+        install_spicetify_cli: o script escreve em diretório de
+        usuário, não em área de root.
+        """
+        _, error = self._require_spicetify_cli()
+        if error is not None:
+            return error
+
+        if os.geteuid() == 0:
+            return CommandResult(
+                False,
+                "Este processo está rodando como root. O Marketplace "
+                "precisa ser instalado como usuário normal — não chame "
+                "este método via pkexec/sudo.",
+                "",
+            )
+
+        cmd = [
+            "bash", "-c",
+            f"curl -fsSL {self.SPICETIFY_MARKETPLACE_INSTALL_URL} | sh",
+        ]
+        result = self._run(cmd, timeout=self.TIMEOUT_LONG, on_line_received=on_line_received)
+        if result.success:
+            return CommandResult(
+                True, "Spicetify Marketplace instalado com sucesso.", result.output
+            )
+        return CommandResult(False, "Falha ao instalar o Spicetify Marketplace.", result.output)
+
+    # ------------------------------------------------------------------ #
+    # 7. Restaurar o Spotify ao estado original
+    # ------------------------------------------------------------------ #
+    def restore_spicetify(
+        self, on_line_received: Optional[Callable[[str], None]] = None
+    ) -> CommandResult:
+        """
+        Executa `spicetify restore` — desfaz temas/extensões e devolve
+        o Spotify ao arquivo original que o Spicetify guardou como
+        backup. Útil quando um tema quebra a UI, ou antes de
+        desinstalar o Spicetify de vez.
+        """
+        spicetify_bin, error = self._require_spicetify_cli()
+        if error is not None:
+            return error
+
+        result = self._run(
+            [spicetify_bin, "restore"],
+            timeout=self.TIMEOUT_LONG,
+            on_line_received=on_line_received,
+        )
+        if result.success:
+            return CommandResult(True, "Spotify restaurado ao estado original.", result.output)
+        return CommandResult(False, "Falha ao executar 'spicetify restore'.", result.output)
 
     # ------------------------------------------------------------------ #
     # Execução assíncrona genérica (não trava a UI)
@@ -421,6 +620,7 @@ class SpicetifyManager:
         target: Callable[..., CommandResult | SpotifyStatus],
         callback: Callable[[CommandResult | SpotifyStatus], None],
         *args,
+        on_line_received: Optional[Callable[[str], None]] = None,
         **kwargs,
     ) -> threading.Thread:
         """
@@ -430,15 +630,55 @@ class SpicetifyManager:
         QMetaObject.invokeMethod, root.after() no Tkinter, ou um
         Queue consumido por um timer).
 
+        on_line_received é keyword-only de propósito: colocá-lo antes
+        de *args faria uma chamada como run_async(alvo, callback, "x")
+        cair silenciosamente no slot errado. Ele só funciona com os
+        métodos que aceitam esse kwarg (install_spotify_apt,
+        fix_permissions, install_spicetify_cli, apply_spicetify,
+        migrate_snap_to_apt, install_marketplace, restore_spicetify). Passar em check_spotify_installation ou
+        ensure_spotify_prefs — que não têm esse parâmetro — resulta
+        num CommandResult de falha entregue ao callback (TypeError
+        capturado internamente), não numa thread morta em silêncio.
+
+        Cada linha chega em on_line_received NA THREAD DESTE WORKER,
+        igual ao próprio 'callback' final — se o front-end for Qt,
+        agende a atualização de widget via QTimer.singleShot(0, ...)
+        dentro do seu wrapper, não toque widgets direto daqui.
+
         Exemplo:
+            def on_line(line):
+                print("[log]", line)
+
             def on_done(result):
                 print(result.success, result.message)
 
-            mgr.run_async(mgr.fix_permissions, on_done)
+            mgr.run_async(
+                mgr.install_spicetify_cli,
+                on_done,
+                on_line_received=on_line,
+            )
         """
         def _worker():
-            with self._lock:
-                result = target(*args, **kwargs)
+            try:
+                with self._lock:
+                    if on_line_received is not None:
+                        result = target(*args, on_line_received=on_line_received, **kwargs)
+                    else:
+                        result = target(*args, **kwargs)
+            except Exception as e:
+                # Sem este try/except, um TypeError (ex: passar
+                # on_line_received para um método que não aceita esse
+                # kwarg) mata a thread em silêncio: o callback nunca
+                # dispara e a UI fica esperando pra sempre, sem
+                # nenhuma pista além de um traceback perdido no
+                # stderr. Isso contradiz o princípio do resto da
+                # classe — nenhuma exceção "solta" para a UI — então
+                # converto em CommandResult de falha e entrego ao
+                # callback normalmente, em vez de deixar a thread
+                # sumir sem avisar ninguém.
+                logger.exception("Exceção não tratada dentro de run_async")
+                callback(CommandResult(False, f"Erro interno inesperado: {e}", ""))
+                return
             callback(result)
 
         thread = threading.Thread(target=_worker, daemon=True)
