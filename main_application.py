@@ -35,6 +35,7 @@ from spicetify_manager import SpicetifyManager
 from spicetify_hub_ui import Palette, SpicetifyHubWindow  # reaproveita paleta e o dashboard já feito
 from app_state import AppState
 from splash_screen import SplashScreen, DiagnosticsResult
+from installation_wizard import InstallationWizard
 
 
 # --------------------------------------------------------------------- #
@@ -89,19 +90,10 @@ class TitleBar(QWidget):
 
 
 # --------------------------------------------------------------------- #
-# Tela placeholder — Installer. O Splash real vive em splash_screen.py;
-# o Dashboard reaproveita a janela já construída no módulo anterior.
+# Nota: a tela de Installer não é registrada antecipadamente — ela
+# depende do DiagnosticsResult que só existe depois que o Splash
+# termina. Ver _build_installer_screen() abaixo.
 # --------------------------------------------------------------------- #
-class InstallerScreen(QWidget):
-    def __init__(self, manager: SpicetifyManager, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.manager = manager
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignCenter)
-        label = QLabel("Tela de instalação (placeholder)")
-        label.setObjectName("installerLabel")
-        label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(label)
 
 
 # --------------------------------------------------------------------- #
@@ -158,20 +150,34 @@ class MainApplication(QMainWindow):
 
         self._screens: dict[AppState, QWidget] = {
             AppState.SPLASH: self.splash_screen,
-            AppState.INSTALLER: InstallerScreen(self.manager),
             # Dashboard é a janela do módulo 2 reaproveitada como
             # widget — evita reescrever cabeçalho/progresso/log aqui.
             AppState.DASHBOARD: self._build_dashboard_screen(),
         }
         for widget in self._screens.values():
             self.stack.addWidget(widget)
+        # INSTALLER fica de fora do loop acima de propósito: só existe
+        # depois que o diagnóstico do Splash chega (ver método abaixo).
 
     def _on_splash_navigate(self, next_state: AppState, result: DiagnosticsResult) -> None:
-        # O diagnóstico já rodou no Splash — não peço pro Installer
-        # nem pro Dashboard refazer as mesmas checagens de subprocess.
         if next_state is AppState.INSTALLER:
-            self.installer_diagnostics = result  # a InstallerScreen real (próximo passo) vai ler isto
+            self._build_installer_screen(result)
         self.switch_screen(next_state)
+
+    def _build_installer_screen(self, diagnostics: DiagnosticsResult) -> None:
+        # Se o usuário voltar a passar pelo Installer (ex: reiniciando
+        # o diagnóstico), descarto o wizard antigo em vez de empilhar
+        # widgets mortos dentro do QStackedWidget.
+        old = self._screens.get(AppState.INSTALLER)
+        if old is not None:
+            self.stack.removeWidget(old)
+            old.deleteLater()
+
+        wizard = InstallationWizard(self.manager, diagnostics)
+        wizard.setup_finished.connect(lambda: self.switch_screen(AppState.DASHBOARD))
+
+        self._screens[AppState.INSTALLER] = wizard
+        self.stack.addWidget(wizard)
 
     def _build_dashboard_screen(self) -> QWidget:
         # SpicetifyHubWindow é um QMainWindow; para viver dentro do
@@ -260,12 +266,6 @@ class MainApplication(QMainWindow):
 
             QWidget#screenStack {{
                 background-color: {Palette.BG};
-            }}
-
-            QLabel#installerLabel {{
-                color: {Palette.TEXT_PRIMARY};
-                font-size: 22px;
-                font-weight: 700;
             }}
         """)
 
