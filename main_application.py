@@ -184,7 +184,7 @@ class MainApplication(QMainWindow):
         # QStackedWidget eu uso o centralWidget dele como a tela, em
         # vez de aninhar uma QMainWindow dentro de outra (não suportado
         # de forma limpa pelo Qt).
-        dashboard_window = SpicetifyHubWindow()
+        dashboard_window = SpicetifyHubWindow(self.manager)
         dashboard_widget = dashboard_window.centralWidget()
         dashboard_widget.setParent(None)
         # Guardo a referência da janela original para acessar seus

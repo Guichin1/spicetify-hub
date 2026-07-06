@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 from spicetify_manager import SpicetifyManager, CommandResult
 from spicetify_hub_ui import Palette
 from splash_screen import Spinner, DiagnosticsResult
+from qt_thread_bridge import MainThreadInvoker
 
 
 # --------------------------------------------------------------------- #
@@ -190,6 +191,7 @@ class InstallationWizard(QWidget):
         super().__init__(parent)
         self.manager = manager
         self.diagnostics = diagnostics
+        self._invoker = MainThreadInvoker(self)
 
         self._steps = self._build_plan(diagnostics)
         self._cards: list[ProgressCard] = []
@@ -408,11 +410,14 @@ class InstallationWizard(QWidget):
         )
 
     def _on_step_finished(self, index: int, result: CommandResult) -> None:
-        # Callback chega numa thread de worker — agendo a atualização
-        # de UI via QTimer.singleShot(0, ...) para garantir execução na
-        # thread principal do Qt, em vez de tocar widgets diretamente
-        # de dentro da thread do SpicetifyManager.
-        QTimer.singleShot(0, lambda: self._handle_step_result(index, result))
+        # Este callback é chamado DENTRO da worker thread do
+        # run_async — QTimer.singleShot NÃO dispara vindo de lá
+        # (testado isoladamente: uma threading.Thread crua não tem
+        # loop de eventos processando o timer, mesmo com a thread
+        # principal rodando normalmente). Diferente da linha 393
+        # acima, que roda a partir da própria thread principal — por
+        # isso aquela continua com singleShot e esta usa o invoker.
+        self._invoker.call_in_main_thread(lambda: self._handle_step_result(index, result))
 
     def _handle_step_result(self, index: int, result: CommandResult) -> None:
         step = self._steps[index]

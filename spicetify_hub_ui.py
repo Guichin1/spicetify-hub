@@ -35,6 +35,9 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 
+from spicetify_manager import SpicetifyManager, CommandResult
+from qt_thread_bridge import MainThreadInvoker
+
 
 # --------------------------------------------------------------------- #
 # Paleta — centralizada aqui de propósito. Se um dia a Spotify trocar o
@@ -164,8 +167,17 @@ class CollapsibleLog(QWidget):
 # Janela principal
 # --------------------------------------------------------------------- #
 class SpicetifyHubWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, manager: SpicetifyManager):
         super().__init__()
+        # Recebida da MainApplication — nunca instanciada aqui dentro.
+        # Uma segunda instância de SpicetifyManager não quebraria nada
+        # sozinha, mas romperia a premissa do projeto inteiro: "o
+        # manager vive uma vez, lá em cima" (ver main_application.py).
+        self.manager = manager
+        # Vive na thread principal (parenteado a este QMainWindow) —
+        # é o que faz o call_in_main_thread funcionar de verdade.
+        self._invoker = MainThreadInvoker(self)
+
         self.setWindowTitle("Spicetify Hub")
         self.setMinimumSize(QSize(560, 620))
 
@@ -291,22 +303,82 @@ class SpicetifyHubWindow(QMainWindow):
         self.install_marketplace_button.clicked.connect(self.on_install_marketplace_clicked)
 
     # ------------------------------------------------------------------
-    # Placeholders — a lógica real entra aqui, disparando
-    # SpicetifyManager.run_async(...) e atualizando a UI pelos
-    # métodos update_progress / update_status / append_log abaixo.
+    # Handlers reais. Os três seguem o mesmo padrão, por isso existe
+    # _run_manager_action: disparar via run_async, jogar cada linha de
+    # log no CollapsibleLog, e mostrar progresso HONESTO — QProgressBar
+    # com range(0,0) vira automaticamente uma barra "ocupada" (padrão
+    # do Qt), porque eu não tenho como saber a porcentagem real de um
+    # `curl | sh` ou `spicetify restore`. Fingir um percentual
+    # incremental aqui seria pior que não mostrar nada.
     # ------------------------------------------------------------------
     def on_auto_setup_clicked(self) -> None:
-        self.log_section.append_line("[Auto-Setup] Iniciado pelo usuário.")
-        self.update_progress(0, "Verificando Spotify...")
-        # TODO: mgr.run_async(mgr.check_spotify_installation, self._on_check_done)
+        # "Auto-Setup" no Dashboard não é a instalação inicial (quem
+        # chega aqui já passou pelo Installer) — é reaplicar o
+        # Spicetify, o caso real de uso pós-Dashboard: uma atualização
+        # do Spotify sobrescreve o tema e o usuário precisa reaplicar.
+        self._run_manager_action(
+            action=self.manager.apply_spicetify,
+            action_label="Auto-Setup",
+            button=self.auto_setup_button,
+        )
 
     def on_restore_backup_clicked(self) -> None:
-        self.log_section.append_line("[Restaurar Backup] Iniciado pelo usuário.")
-        # TODO: mgr.run_async(mgr.apply_spicetify, self._on_restore_done)
+        self._run_manager_action(
+            action=self.manager.restore_spicetify,
+            action_label="Restaurar Backup",
+            button=self.restore_backup_button,
+        )
 
     def on_install_marketplace_clicked(self) -> None:
-        self.log_section.append_line("[Marketplace] Iniciado pelo usuário.")
-        # TODO: integrar instalação do Spicetify Marketplace
+        self._run_manager_action(
+            action=self.manager.install_marketplace,
+            action_label="Instalar Marketplace",
+            button=self.install_marketplace_button,
+        )
+
+    # ------------------------------------------------------------------
+    def _run_manager_action(self, action, action_label: str, button: QPushButton) -> None:
+        self.log_section.append_line(f"[{action_label}] Iniciado pelo usuário.")
+        self.update_progress(0, f"{action_label}...")
+        self.progress_bar.setRange(0, 0)  # modo indeterminado
+        self._set_actions_enabled(False)
+
+        def on_line(line: str) -> None:
+            # Chega na thread do worker (ver run_async/_run em
+            # spicetify_manager.py). QTimer.singleShot NÃO funciona
+            # aqui — testei isoladamente e confirmei que nunca dispara
+            # vindo de uma threading.Thread crua. O invoker usa Signal,
+            # que é thread-safe de verdade.
+            self._invoker.call_in_main_thread(lambda: self.log_section.append_line(line))
+
+        def on_finished(result: CommandResult) -> None:
+            self._invoker.call_in_main_thread(
+                lambda: self._on_action_finished(result, action_label, button)
+            )
+
+        self.manager.run_async(action, on_finished, on_line_received=on_line)
+
+    def _on_action_finished(self, result: CommandResult, action_label: str, button: QPushButton) -> None:
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100 if result.success else 0)
+        self.update_progress(
+            100 if result.success else 0,
+            f"{action_label} concluído." if result.success else f"{action_label} falhou.",
+        )
+        status_word = "Concluído" if result.success else "Falhou"
+        self.log_section.append_line(f"[{action_label}] {status_word}: {result.message}")
+        self._set_actions_enabled(True)
+
+    def _set_actions_enabled(self, enabled: bool) -> None:
+        # Desabilito os TRÊS botões durante qualquer ação, não só o
+        # clicado. O SpicetifyManager serializa chamadas via lock
+        # interno (ver run_async) — duas ações "simultâneas" na
+        # prática rodariam uma depois da outra sem avisar ninguém, o
+        # que pareceria a UI travada. Bloquear os botões deixa isso
+        # explícito em vez de escondido.
+        self.auto_setup_button.setEnabled(enabled)
+        self.restore_backup_button.setEnabled(enabled)
+        self.install_marketplace_button.setEnabled(enabled)
 
     # ------------------------------------------------------------------
     # API pública para quem for orquestrar (ex: um Controller que ouve
@@ -431,7 +503,11 @@ class SpicetifyHubWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
-    window = SpicetifyHubWindow()
+    manager = SpicetifyManager()  # só existe aqui porque este arquivo,
+    # rodado standalone, não tem uma MainApplication por cima criando
+    # o manager único. Em produção é o main_application.py quem cria
+    # e injeta esta instância.
+    window = SpicetifyHubWindow(manager)
     window.show()
     sys.exit(app.exec())
 
